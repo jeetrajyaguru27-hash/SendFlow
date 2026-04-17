@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from ..auth import get_current_user
 from ..database import get_db
-from ..job_queue import CampaignAlreadyQueuedError, cancel_job, enqueue_campaign, get_job_status
+from ..email_sender import send_campaign_emails
 from ..models import Campaign, EmailLog, Lead
 from ..schemas import Campaign as CampaignSchema
 from ..schemas import (
@@ -56,12 +56,10 @@ def _get_owned_campaign(campaign_id: int, user_id: int, db: Session) -> Campaign
 def _build_campaign_status(campaign: Campaign, force_send: bool = False) -> str:
     if force_send:
         return "running"
-    if campaign.send_start_time and campaign.send_start_time > datetime.now(pytz.UTC):
-        return "scheduled"
-    return "running"
+    return "scheduled"
 
 
-def _start_campaign_job(campaign: Campaign, user_id: int, db: Session, force_send: bool = False):
+def _activate_campaign(campaign: Campaign, db: Session, force_send: bool = False):
     pending_leads_count = db.query(Lead).filter(
         Lead.campaign_id == campaign.id,
         Lead.status == "pending",
@@ -75,20 +73,6 @@ def _start_campaign_job(campaign: Campaign, user_id: int, db: Session, force_sen
 
     campaign.status = _build_campaign_status(campaign, force_send=force_send)
     db.commit()
-
-    try:
-        return enqueue_campaign(campaign.id, user_id, force_send=force_send)
-    except CampaignAlreadyQueuedError as exc:
-        campaign.status = "queued"
-        db.commit()
-        raise HTTPException(
-            status_code=400,
-            detail=f"Campaign is already queued or running (job: {exc.job_id})",
-        )
-    except Exception:
-        campaign.status = "draft"
-        db.commit()
-        raise
 
 
 def _find_column(headers: List[str], lower_headers: List[str], candidates: List[str]) -> str:
@@ -448,10 +432,10 @@ async def send_campaign(
 ):
     """Start a campaign. If it has a future start time it stays scheduled until then."""
     campaign = _get_owned_campaign(campaign_id, current_user.id, db)
-    job_id = _start_campaign_job(campaign, current_user.id, db)
+    _activate_campaign(campaign, db)
     return {
-        "message": "Campaign scheduled in background" if campaign.status == "scheduled" else "Campaign sending started in background",
-        "job_id": job_id,
+        "message": "Campaign scheduled for GitHub Actions processing" if campaign.status == "scheduled" else "Campaign activated for scheduler processing",
+        "job_id": None,
         "status": campaign.status,
         "scheduled_for": campaign.send_start_time,
     }
@@ -467,11 +451,15 @@ async def send_campaign_now(
     campaign = _get_owned_campaign(campaign_id, current_user.id, db)
     campaign.send_start_time = datetime.now(pytz.UTC)
     db.commit()
-    job_id = _start_campaign_job(campaign, current_user.id, db, force_send=True)
+    _activate_campaign(campaign, db, force_send=True)
+    result = send_campaign_emails(campaign.id, current_user.id, force_send=True)
     return {
-        "message": "Campaign sending started immediately",
-        "job_id": job_id,
-        "status": "running",
+        "message": "Campaign send-now batch processed",
+        "job_id": None,
+        "status": result["status"],
+        "sent": result["sent"],
+        "failed": result["failed"],
+        "remaining": result["remaining"],
     }
 
 
@@ -483,7 +471,7 @@ async def get_campaign_job_status(
     current_user=Depends(get_current_user),
 ):
     _get_owned_campaign(campaign_id, current_user.id, db)
-    return get_job_status(job_id)
+    return {"id": job_id, "status": "not_applicable", "message": "Dedicated background jobs are disabled in GitHub Actions mode."}
 
 
 @router.delete("/{campaign_id}/job/{job_id}")
@@ -496,8 +484,7 @@ async def cancel_campaign_job(
     campaign = _get_owned_campaign(campaign_id, current_user.id, db)
     campaign.status = "paused"
     db.commit()
-    cancelled = cancel_job(job_id)
-    return {"message": "Campaign job cancelled" if cancelled else "Failed to cancel job"}
+    return {"message": "Campaign paused"}
 
 
 @router.delete("/{campaign_id}")

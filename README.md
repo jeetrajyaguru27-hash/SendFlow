@@ -8,7 +8,7 @@ SendFlow is a Gmail outreach app with:
 - lead import and mapping
 - inbox and reply tracking
 - analytics
-- Redis/RQ background sending
+- GitHub Actions scheduled campaign processing
 
 ## Local Run
 
@@ -32,8 +32,8 @@ Important variables:
 - `GOOGLE_CLIENT_SECRET`
 - `GOOGLE_REDIRECT_URI`
 - `SECRET_KEY`
+- `SCHEDULER_SECRET`
 - `DATABASE_URL`
-- `REDIS_URL`
 - `FRONTEND_URL`
 - `CORS_ORIGINS`
 - `BASE_URL`
@@ -42,8 +42,8 @@ Important variables:
 
 Recommended:
 
-- Backend + worker + Redis + Postgres on Render
-- Frontend on Vercel or Render Static Site
+- Backend + frontend + Postgres on Render
+- GitHub Actions cron for scheduled sending
 
 Deployment guide:
 
@@ -58,4 +58,4 @@ Deployment guide:
 
 - Dev can use SQLite
 - Production should use Postgres
-- Production should use Redis for background jobs
+- Production uses GitHub Actions instead of a dedicated background worker

@@ -10,11 +10,9 @@ LOG_DIR="$ROOT_DIR/.logs"
 
 mkdir -p "$LOG_DIR"
 BACKEND_LOG="$LOG_DIR/backend.log"
-WORKER_LOG="$LOG_DIR/worker.log"
 FRONTEND_LOG="$LOG_DIR/frontend.log"
 
 BACKEND_PID=""
-WORKER_PID=""
 FRONTEND_PID=""
 SHUTTING_DOWN=0
 
@@ -36,11 +34,9 @@ pkill -f "streamlit run .*frontend/app.py" 2>/dev/null || true
 pkill -f "vite" 2>/dev/null || true
 pkill -f "sendflow-pro-main" 2>/dev/null || true
 pkill -f "python3 -m uvicorn app.main:app" 2>/dev/null || true
-pkill -f "python3 worker.py" 2>/dev/null || true
 
 echo "📝 Resetting service logs..."
 : > "$BACKEND_LOG"
-: > "$WORKER_LOG"
 : > "$FRONTEND_LOG"
 
 mkdir -p "$ROOT_DIR/database"
@@ -72,7 +68,6 @@ cleanup() {
     echo ""
     echo "🛑 Shutting down services..."
     stop_service "$BACKEND_PID"
-    stop_service "$WORKER_PID"
     stop_service "$FRONTEND_PID"
 }
 
@@ -86,16 +81,6 @@ start_backend() {
     ) >>"$BACKEND_LOG" 2>&1 &
     BACKEND_PID=$!
     echo "📊 Backend PID: $BACKEND_PID"
-}
-
-start_worker() {
-    echo "🔄 Starting RQ worker for email campaigns..."
-    (
-        cd "$BACKEND_DIR" &&
-        python3 worker.py
-    ) >>"$WORKER_LOG" 2>&1 &
-    WORKER_PID=$!
-    echo "⚙️  Worker PID: $WORKER_PID"
 }
 
 start_frontend() {
@@ -129,8 +114,6 @@ echo ""
 
 start_backend
 sleep 2
-start_worker
-sleep 2
 start_frontend
 
 echo ""
@@ -144,7 +127,6 @@ while true; do
     fi
 
     restart_if_needed "Backend" "$BACKEND_PID" start_backend
-    restart_if_needed "Worker" "$WORKER_PID" start_worker
     restart_if_needed "Frontend" "$FRONTEND_PID" start_frontend
     sleep 3
 done

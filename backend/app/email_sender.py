@@ -3,6 +3,7 @@ import time
 import re
 import hmac
 import hashlib
+import asyncio
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func
@@ -212,6 +213,17 @@ def get_hourly_spacing_seconds(campaign: Optional[Campaign] = None) -> int:
     return max(60, int(3600 / hourly_rate))
 
 
+def get_campaign_sent_last_hour(campaign_id: int, db: Session) -> int:
+    """Return how many emails this campaign sent in the last rolling hour."""
+    one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+    sent_count = db.query(func.count(EmailLog.id)).filter(
+        EmailLog.campaign_id == campaign_id,
+        EmailLog.timestamp >= one_hour_ago,
+        EmailLog.status.in_(["sent", "delivered"]),
+    ).scalar()
+    return sent_count or 0
+
+
 def get_display_name_parts(lead: Lead) -> tuple[str, str]:
     raw_name = (lead.name or "").strip()
     custom_first_name = ""
@@ -410,8 +422,9 @@ def seconds_until_next_send_window(user: User, lead: Lead, campaign: Optional[Ca
 
 
 def send_campaign_emails(campaign_id: int, user_id: int, force_send: bool = False):
-    """Enhanced RQ job to send emails with all new features and scheduled delivery."""
+    """Process a single due batch for a campaign without long-lived worker sleeps."""
     db: Session = SessionLocal()
+    campaign = None
     try:
         campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
         user = db.query(User).filter(User.id == user_id).first()
@@ -420,18 +433,28 @@ def send_campaign_emails(campaign_id: int, user_id: int, force_send: bool = Fals
             print(f"❌ Campaign {campaign_id} or User {user_id} not found")
             return
 
-        # Handle scheduled send start time if specified
+        now = datetime.now(timezone.utc)
+
+        # Respect future campaign start times unless explicitly forced.
         campaign_start = make_utc_aware(campaign.send_start_time)
-        if campaign_start:
-            now = datetime.now(timezone.utc)
-            if now < campaign_start:
-                # Wait until scheduled time
-                wait_seconds = (campaign_start - now).total_seconds()
-                if wait_seconds > 0:
-                    print(f"⏳ Campaign {campaign_id} scheduled to start at {campaign_start}. Waiting {wait_seconds} seconds...")
-                    time.sleep(wait_seconds)
-            campaign.status = "running"
+        if campaign_start and not force_send and now < campaign_start:
+            campaign.status = "scheduled"
             db.commit()
+            return {
+                "campaign_id": campaign_id,
+                "status": "scheduled",
+                "sent": 0,
+                "failed": 0,
+                "remaining": db.query(func.count(Lead.id)).filter(
+                    Lead.campaign_id == campaign_id,
+                    Lead.status == "pending",
+                    Lead.opted_out.is_(False),
+                ).scalar() or 0,
+                "reason": "campaign_not_started",
+            }
+
+        campaign.status = "running"
+        db.commit()
         
         # Get daily limits and respect warm-up stages
         daily_limit = get_current_daily_limit(user)
@@ -442,7 +465,18 @@ def send_campaign_emails(campaign_id: int, user_id: int, force_send: bool = Fals
             print(f"Daily limit reached for campaign {campaign_id}")
             campaign.status = "paused"
             db.commit()
-            return
+            return {
+                "campaign_id": campaign_id,
+                "status": "paused",
+                "sent": 0,
+                "failed": 0,
+                "remaining": db.query(func.count(Lead.id)).filter(
+                    Lead.campaign_id == campaign_id,
+                    Lead.status == "pending",
+                    Lead.opted_out.is_(False),
+                ).scalar() or 0,
+                "reason": "daily_limit_reached",
+            }
 
         # Get pending emails for this campaign and exclude unsubscribed recipients
         pending_leads = db.query(Lead).filter(
@@ -455,26 +489,47 @@ def send_campaign_emails(campaign_id: int, user_id: int, force_send: bool = Fals
             print(f"✅ No pending leads for campaign {campaign_id}")
             campaign.status = "completed"
             db.commit()
-            return
+            return {
+                "campaign_id": campaign_id,
+                "status": "completed",
+                "sent": 0,
+                "failed": 0,
+                "remaining": 0,
+                "reason": "no_pending_leads",
+            }
 
-        # Max 30 emails per batch, respect daily limit
+        # Respect hourly batching without requiring a persistent worker.
         batch_size = max(1, campaign.hourly_send_rate or 5)
+        sent_last_hour = 0 if force_send else get_campaign_sent_last_hour(campaign_id, db)
+        hourly_remaining = batch_size if force_send else max(0, batch_size - sent_last_hour)
         emails_remaining_today = daily_limit - emails_sent_today
-        emails_to_send = min(len(pending_leads), batch_size, emails_remaining_today)
+        emails_to_send = min(len(pending_leads), hourly_remaining, emails_remaining_today)
+
+        if emails_to_send <= 0:
+            campaign.status = "scheduled"
+            db.commit()
+            return {
+                "campaign_id": campaign_id,
+                "status": "scheduled",
+                "sent": 0,
+                "failed": 0,
+                "remaining": len(pending_leads),
+                "reason": "hourly_limit_reached",
+            }
         
         emails_sent_this_batch = 0
         emails_failed_this_batch = 0
-        
-        for i in range(emails_to_send):
-            lead = pending_leads[i]
-            
-            # Enforce recipient business hours and working window unless forced by send-now
+
+        processed_candidates = 0
+        for lead in pending_leads:
+            if processed_candidates >= emails_to_send:
+                break
+
+            # Skip until the next cron tick if the lead is outside the allowed send window.
             if not force_send and not is_optimal_send_time(user, lead, None, campaign):
-                wait_seconds = seconds_until_next_send_window(user, lead, campaign=campaign)
-                print(f"⏰ Lead {lead.email} is outside working hours. Waiting {wait_seconds} seconds before retrying.")
-                time.sleep(wait_seconds)
-                # Refresh lead state after wait
-                db.refresh(lead)
+                continue
+
+            processed_candidates += 1
 
             # Handle A/B testing
             variant = None
@@ -509,15 +564,6 @@ def send_campaign_emails(campaign_id: int, user_id: int, force_send: bool = Fals
                 db.commit()
             else:
                 emails_failed_this_batch += 1
-            
-            # Stop if reached hourly cap
-            if emails_sent_this_batch >= batch_size:
-                break
-            
-            if i < emails_to_send - 1:  # Don't sleep after last email
-                delay_seconds = max(get_delay_seconds(campaign), get_hourly_spacing_seconds(campaign))
-                print(f"⏸️  Campaign {campaign_id} waiting {delay_seconds} seconds before next send.")
-                time.sleep(delay_seconds)
         
         # Update batch counter
         campaign.emails_sent_in_batch += emails_sent_this_batch
@@ -534,83 +580,130 @@ def send_campaign_emails(campaign_id: int, user_id: int, force_send: bool = Fals
         elif emails_sent_today + emails_sent_this_batch >= daily_limit:
             campaign.status = "paused"
             print(f"⏸️ Campaign {campaign_id} paused after hitting daily limit. Sent {emails_sent_this_batch}, Failed {emails_failed_this_batch}. Remaining: {remaining_pending}")
-        elif emails_sent_this_batch >= batch_size:
-            campaign.status = "queued"
-            print(f"📋 Campaign {campaign_id} queued for next hourly batch. Sent {emails_sent_this_batch}, Failed {emails_failed_this_batch}. Remaining: {remaining_pending}")
         else:
-            campaign.status = "running"
-            print(f"📊 Campaign {campaign_id} running. Sent {emails_sent_this_batch}, Failed {emails_failed_this_batch}. Remaining: {remaining_pending}")
+            campaign.status = "scheduled"
+            print(f"📋 Campaign {campaign_id} scheduled for the next scheduler run. Sent {emails_sent_this_batch}, Failed {emails_failed_this_batch}. Remaining: {remaining_pending}")
         
         db.commit()
+        return {
+            "campaign_id": campaign_id,
+            "status": campaign.status,
+            "sent": emails_sent_this_batch,
+            "failed": emails_failed_this_batch,
+            "remaining": remaining_pending,
+        }
 
     except Exception as e:
         print(f"❌ Error in send_campaign_emails: {str(e)}")
         if campaign:
             campaign.status = "failed"
             db.commit()
+        raise
     finally:
         db.close()
 
-async def check_bounces_and_replies():
-    """Background task to check for bounces and replies."""
-    while True:
-        db: Session = SessionLocal()
-        try:
-            # Get all sent emails from the last 7 days
-            seven_days_ago = datetime.utcnow() - timedelta(days=7)
 
-            sent_logs = db.query(EmailLog).filter(
-                EmailLog.status == "sent",
-                EmailLog.timestamp >= seven_days_ago
-            ).all()
+def process_due_campaigns() -> Dict[str, object]:
+    """Run one scheduler tick across all campaigns that should send now."""
+    db: Session = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        campaigns = db.query(Campaign).filter(
+            Campaign.status.in_(["scheduled", "queued", "running", "paused"])
+        ).all()
 
-            for log in sent_logs:
-                try:
-                    # Get user for this log
-                    user = db.query(User).filter(User.id == log.user_id).first()
-                    if not user:
-                        continue
+        results = []
+        for campaign in campaigns:
+            pending_count = db.query(func.count(Lead.id)).filter(
+                Lead.campaign_id == campaign.id,
+                Lead.status == "pending",
+                Lead.opted_out.is_(False),
+            ).scalar() or 0
+            if pending_count == 0:
+                if campaign.status != "completed":
+                    campaign.status = "completed"
+                continue
 
-                    # Check for bounces and replies
-                    if not log.message_id:
-                        continue
-                    result = check_for_bounces_and_replies(user, log.message_id)
+            campaign_start = make_utc_aware(campaign.send_start_time)
+            if campaign_start and campaign_start > now:
+                campaign.status = "scheduled"
+                continue
 
-                    # Update status based on results
-                    lead = db.query(Lead).filter(Lead.id == log.lead_id).first()
-                    if not lead:
-                        continue
+            results.append(send_campaign_emails(campaign.id, campaign.user_id, force_send=False))
 
-                    if result['has_bounce']:
-                        log.status = "bounced"
-                        lead.status = "bounced"
-                        lead.bounced_at = datetime.utcnow()
-                        lead.lifecycle_stage = "unsubscribed"
-                    elif result['has_reply']:
-                        log.status = "replied"
-                        lead.status = "replied"
-                        lead.replied_at = datetime.utcnow()
-                        lead.reply_category = result.get('reply_category')
-                        lead.lifecycle_stage = "replied"
-                        lead.lead_score = (lead.lead_score or 0) + 15
-                        if result.get('reply_category') in {"interested", "referral"}:
-                            lead.needs_follow_up = True
-                        reply_content = (result.get("reply_content") or "").lower()
-                        if "unsubscribe" in reply_content or "remove me" in reply_content:
-                            lead.opted_out = True
-                            lead.opted_out_at = datetime.utcnow()
-                            lead.lifecycle_stage = "unsubscribed"
+        db.commit()
+        return {
+            "processed_campaigns": len(results),
+            "results": results,
+            "ran_at": now.isoformat(),
+        }
+    finally:
+        db.close()
 
-                    db.commit()
 
-                except Exception as e:
-                    print(f"Error checking bounce/reply for log {log.id}: {str(e)}")
+def sync_bounces_and_replies_once() -> Dict[str, int]:
+    """One-pass inbox sync for scheduler usage."""
+    db: Session = SessionLocal()
+    checked = 0
+    updated = 0
+    try:
+        seven_days_ago = datetime.utcnow() - timedelta(days=7)
+        sent_logs = db.query(EmailLog).filter(
+            EmailLog.status == "sent",
+            EmailLog.timestamp >= seven_days_ago
+        ).all()
+
+        for log in sent_logs:
+            try:
+                user = db.query(User).filter(User.id == log.user_id).first()
+                if not user or not log.message_id:
                     continue
 
+                checked += 1
+                result = check_for_bounces_and_replies(user, log.message_id)
+                lead = db.query(Lead).filter(Lead.id == log.lead_id).first()
+                if not lead:
+                    continue
+
+                before_status = log.status
+                if result['has_bounce']:
+                    log.status = "bounced"
+                    lead.status = "bounced"
+                    lead.bounced_at = datetime.utcnow()
+                    lead.lifecycle_stage = "unsubscribed"
+                elif result['has_reply']:
+                    log.status = "replied"
+                    lead.status = "replied"
+                    lead.replied_at = datetime.utcnow()
+                    lead.reply_category = result.get('reply_category')
+                    lead.lifecycle_stage = "replied"
+                    lead.lead_score = (lead.lead_score or 0) + 15
+                    if result.get('reply_category') in {"interested", "referral"}:
+                        lead.needs_follow_up = True
+                    reply_content = (result.get("reply_content") or "").lower()
+                    if "unsubscribe" in reply_content or "remove me" in reply_content:
+                        lead.opted_out = True
+                        lead.opted_out_at = datetime.utcnow()
+                        lead.lifecycle_stage = "unsubscribed"
+
+                if log.status != before_status:
+                    updated += 1
+                db.commit()
+            except Exception as e:
+                print(f"Error checking bounce/reply for log {log.id}: {str(e)}")
+                continue
+
+        return {"checked": checked, "updated": updated}
+    finally:
+        db.close()
+
+async def run_bounce_and_reply_loop():
+    """Background task to check for bounces and replies."""
+    while True:
+        try:
+            sync_bounces_and_replies_once()
         except Exception as e:
             print(f"Error in check_bounces_and_replies: {str(e)}")
-        finally:
-            db.close()
 
         # Check every hour
         await asyncio.sleep(3600)

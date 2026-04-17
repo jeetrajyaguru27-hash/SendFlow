@@ -1,0 +1,13 @@
+venv/
+.env
+.logs/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+
+sendflow-pro-main/node_modules/
+sendflow-pro-main/dist/
+dist/
+build/

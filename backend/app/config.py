@@ -18,6 +18,7 @@ class Settings:
 
     # Application
     SECRET_KEY: str = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+    SCHEDULER_SECRET: str = os.getenv("SCHEDULER_SECRET", "")
     DATABASE_URL: str = os.getenv("DATABASE_URL", f"sqlite:///{DB_FILE}")
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:8081")
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")

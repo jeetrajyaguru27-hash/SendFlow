@@ -1,0 +1,28 @@
+name: SendFlow Scheduler
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sendflow-scheduler
+  cancel-in-progress: false
+
+jobs:
+  run-scheduler:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger SendFlow scheduler
+        env:
+          SEND_FLOW_API_URL: ${{ secrets.SEND_FLOW_API_URL }}
+          SCHEDULER_SECRET: ${{ secrets.SCHEDULER_SECRET }}
+        run: |
+          if [ -z "$SEND_FLOW_API_URL" ] || [ -z "$SCHEDULER_SECRET" ]; then
+            echo "Missing SEND_FLOW_API_URL or SCHEDULER_SECRET GitHub secret."
+            exit 1
+          fi
+
+          curl --fail-with-body --retry 3 --retry-all-errors --max-time 300 \
+            -X POST "${SEND_FLOW_API_URL%/}/internal/scheduler/run" \
+            -H "X-Scheduler-Secret: $SCHEDULER_SECRET"

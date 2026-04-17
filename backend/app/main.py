@@ -4,31 +4,28 @@ from contextlib import asynccontextmanager
 import uvicorn
 from sqlalchemy import func
 
+from app.config import settings
 from app.database import create_tables
 from app.database import SessionLocal
 from app.models import Campaign, Lead
-from app.job_queue import uses_persistent_queue
 from app.routers import auth, campaigns, analytics, sequences
-from app.routers import inbox, unsubscribe
+from app.routers import inbox, internal, unsubscribe
 from app.tracking import get_tracking_pixel, track_link_click
 from migrate import migrate_database
 
 
 def recover_orphaned_campaigns() -> None:
-    """Reset local in-memory campaigns that were left marked as running."""
-    if uses_persistent_queue():
-        return
-
+    """Reset transient in-progress statuses on startup."""
     db = SessionLocal()
     try:
-        running_campaigns = db.query(Campaign).filter(Campaign.status == "running").all()
+        running_campaigns = db.query(Campaign).filter(Campaign.status.in_(["running", "queued"])).all()
         for campaign in running_campaigns:
             pending_leads = db.query(func.count(Lead.id)).filter(
                 Lead.campaign_id == campaign.id,
                 Lead.status == "pending",
                 Lead.opted_out.is_(False)
             ).scalar() or 0
-            campaign.status = "draft" if pending_leads > 0 else "completed"
+            campaign.status = "scheduled" if pending_leads > 0 else "completed"
         db.commit()
     finally:
         db.close()
@@ -64,6 +61,7 @@ app.include_router(campaigns.router, prefix="/campaigns", tags=["Campaigns"])
 app.include_router(sequences.router, prefix="/sequences", tags=["Sequences"])
 app.include_router(analytics.router, prefix="/analytics", tags=["Analytics"])
 app.include_router(inbox.router, prefix="/inbox", tags=["Inbox"])
+app.include_router(internal.router, prefix="/internal", tags=["Internal"])
 app.include_router(unsubscribe.router, tags=["Unsubscribe"])
 
 # Tracking endpoints (public, no auth required)
