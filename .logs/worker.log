@@ -1,0 +1,33 @@
+🚀 Starting RQ worker for email campaigns...
+📧 Worker will process email campaign jobs
+⏹️  Press Ctrl+C to stop
+22:04:02 Worker rq:worker:5ce3e87923474b2cb3c1042d530253d3 started with PID 43676, version 1.15.1
+22:04:02 Subscribing to channel rq:pubsub:5ce3e87923474b2cb3c1042d530253d3
+22:04:02 *** Listening on email_campaigns...
+22:19:27 Cleaning registries for queue: email_campaigns
+StartedJobRegistry cleanup: Moving job to FailedJobRegistry (due to AbandonedJobError)
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+⏸️  Campaign 5 waiting 72 seconds before next send.
+✅ Campaign 5 completed! Sent 20 emails total.
+22:26:49 email_campaigns: Job OK (5ba43ab2-3d78-49da-a506-429f2c8191c4)
+22:26:49 Result is kept for 500 seconds
+22:26:49 Worker rq:worker:d38ddc88a86844cb8b85cc3ff394925b: stopping on request
+22:26:49 Unsubscribing from channel rq:pubsub:d38ddc88a86844cb8b85cc3ff394925b
+22:46:28 Cleaning registries for queue: email_campaigns

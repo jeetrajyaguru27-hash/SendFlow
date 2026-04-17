@@ -1,0 +1,616 @@
+import random
+import time
+import re
+import hmac
+import hashlib
+from datetime import datetime, timedelta, timezone
+from sqlalchemy.orm import Session
+from sqlalchemy import and_, or_, func
+from typing import List, Dict, Optional
+import pytz
+
+from .database import SessionLocal
+from .models import (
+    Campaign, Lead, EmailLog, User, Sequence, SequenceStep, 
+    SequenceEnrollment, DailySendLog
+)
+from .gmail_service import send_message, check_for_bounces_and_replies
+from .tracking import generate_tracking_id, process_message_with_tracking
+from .config import settings
+
+def make_utc_aware(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+def get_current_daily_limit(user: User) -> int:
+    """Get the current daily email limit for a user based on warm-up stage."""
+    configured_limit = user.custom_daily_limit or user.daily_limit
+    if user.warmup_stage == 0:
+        return configured_limit  # Default 30
+    
+    # Warm-up stages: 5, 10, 15, 20, 25, 30 emails per day
+    warmup_limits = [5, 10, 15, 20, 25, 30]
+    if 1 <= user.warmup_stage <= len(warmup_limits):
+        return warmup_limits[user.warmup_stage - 1]
+    return configured_limit
+
+def get_emails_sent_today(user_id: int, db: Session) -> int:
+    """Get the number of emails sent today by a user."""
+    today = datetime.now(timezone.utc).date()
+    today_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+    today_end = datetime.combine(today, datetime.max.time(), tzinfo=timezone.utc)
+    
+    sent_count = db.query(func.count(EmailLog.id)).filter(
+        EmailLog.user_id == user_id,
+        EmailLog.timestamp >= today_start,
+        EmailLog.timestamp <= today_end,
+        EmailLog.status.in_(["sent", "delivered"])
+    ).scalar()
+    
+    return sent_count or 0
+
+def get_pending_emails_for_user(user_id: int, db: Session) -> List[Dict]:
+    """Get all pending emails for a user across campaigns and sequences."""
+    pending_emails = []
+    
+    # Get pending campaign leads
+    campaign_leads = db.query(Lead, Campaign).join(Campaign).filter(
+        Campaign.user_id == user_id,
+        Lead.status == "pending",
+        Lead.opted_out.is_(False),
+        Campaign.status == "running"
+    ).all()
+    
+    for lead, campaign in campaign_leads:
+        pending_emails.append({
+            "type": "campaign",
+            "lead": lead,
+            "campaign": campaign,
+            "sequence_step": None,
+            "priority": lead.priority,
+            "scheduled_time": None
+        })
+    
+    # Get pending sequence enrollments
+    sequence_enrollments = db.query(SequenceEnrollment, Lead, Sequence).join(
+        Lead, SequenceEnrollment.lead_id == Lead.id
+    ).join(
+        Sequence, SequenceEnrollment.sequence_id == Sequence.id
+    ).filter(
+        Sequence.user_id == user_id,
+        SequenceEnrollment.completed_at.is_(None),
+        SequenceEnrollment.paused_at.is_(None),
+        Lead.opted_out.is_(False),
+        Lead.status.in_(["pending", "sent"])  # Allow sequence emails even if previously contacted
+    ).all()
+    
+    for enrollment, lead, sequence in sequence_enrollments:
+        # Check if next step is due
+        next_step = db.query(SequenceStep).filter(
+            SequenceStep.sequence_id == sequence.id,
+            SequenceStep.step_number == enrollment.current_step
+        ).first()
+        
+        if next_step and enrollment.next_send_at:
+            next_send_at = make_utc_aware(enrollment.next_send_at)
+            if next_send_at <= datetime.now(timezone.utc):
+                pending_emails.append({
+                    "type": "sequence",
+                    "lead": lead,
+                    "campaign": None,
+                    "sequence_step": next_step,
+                    "priority": next_step.priority,
+                    "scheduled_time": next_send_at
+                })
+    
+    # Sort by priority (high > normal > low) then by scheduled time
+    priority_order = {"high": 0, "normal": 1, "low": 2}
+    pending_emails.sort(key=lambda x: (
+        priority_order.get(x["priority"], 1),
+        x["scheduled_time"] or datetime.max.replace(tzinfo=timezone.utc)
+    ))
+    
+    return pending_emails
+
+def is_optimal_send_time(user: User, lead: Lead, sequence_step: Optional[SequenceStep] = None, campaign: Optional[Campaign] = None) -> bool:
+    """Check if current time is optimal for sending to this lead."""
+    now = datetime.now(timezone.utc)
+    
+    # Get recipient timezone
+    recipient_tz = pytz.timezone(lead.timezone or user.timezone or "UTC")
+    local_now = now.astimezone(recipient_tz)
+    
+    # Default business hours: 9 AM - 5 PM local time
+    start_hour = 9
+    end_hour = 17
+    weekdays_only = True
+    
+    if sequence_step:
+        if sequence_step.send_window_start:
+            start_hour = int(sequence_step.send_window_start.split(":")[0])
+        if sequence_step.send_window_end:
+            end_hour = int(sequence_step.send_window_end.split(":")[0])
+        weekdays_only = sequence_step.weekdays_only
+    elif campaign:
+        if campaign.send_window_start:
+            start_hour = int(campaign.send_window_start.split(":")[0])
+        if campaign.send_window_end:
+            end_hour = int(campaign.send_window_end.split(":")[0])
+        weekdays_only = campaign.send_window_weekdays_only
+    
+    if weekdays_only and local_now.weekday() >= 5:  # Saturday = 5, Sunday = 6
+        return False
+    
+    if not (start_hour <= local_now.hour < end_hour):
+        return False
+    
+    return True
+
+def parse_spintax(text: str) -> str:
+    """Expand simple spintax syntax in a template string."""
+    if not text:
+        return text
+
+    pattern = re.compile(r"\{([^{}]+)\}")
+
+    def replace(match):
+        options = match.group(1).split("|")
+        return random.choice(options).strip()
+
+    while True:
+        new_text = pattern.sub(replace, text)
+        if new_text == text:
+            break
+        text = new_text
+
+    return text
+
+
+def generate_unsubscribe_token(lead_id: int) -> str:
+    secret = settings.SECRET_KEY.encode("utf-8")
+    payload = str(lead_id).encode("utf-8")
+    digest = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+    return f"{lead_id}:{digest}"
+
+
+def verify_unsubscribe_token(token: str) -> Optional[int]:
+    try:
+        lead_id_text, signature = token.split(":", 1)
+        expected = hmac.new(settings.SECRET_KEY.encode("utf-8"), lead_id_text.encode("utf-8"), hashlib.sha256).hexdigest()
+        if hmac.compare_digest(expected, signature):
+            return int(lead_id_text)
+    except Exception:
+        return None
+    return None
+
+
+def get_unsubscribe_url(lead: Lead) -> str:
+    token = generate_unsubscribe_token(lead.id)
+    return f"{settings.BASE_URL}/unsubscribe/{token}"
+
+
+def get_delay_seconds(campaign: Optional[Campaign] = None) -> int:
+    min_delay = settings.MIN_DELAY_MINUTES
+    max_delay = settings.MAX_DELAY_MINUTES
+    if campaign:
+        if campaign.min_delay_minutes is not None:
+            min_delay = campaign.min_delay_minutes
+        if campaign.max_delay_minutes is not None:
+            max_delay = campaign.max_delay_minutes
+    min_delay = max(0, min_delay)
+    max_delay = max(min_delay, max_delay)
+    return random.randint(min_delay, max_delay) * 60
+
+
+def get_hourly_spacing_seconds(campaign: Optional[Campaign] = None) -> int:
+    hourly_rate = 5
+    if campaign and campaign.hourly_send_rate:
+        hourly_rate = max(1, campaign.hourly_send_rate)
+    return max(60, int(3600 / hourly_rate))
+
+
+def get_display_name_parts(lead: Lead) -> tuple[str, str]:
+    raw_name = (lead.name or "").strip()
+    custom_first_name = ""
+    if lead.custom_fields:
+        custom_first_name = str(lead.custom_fields.get("first_name") or "").strip()
+
+    candidate = raw_name or custom_first_name or lead.email.split("@")[0]
+    if "@" in candidate:
+        candidate = candidate.split("@")[0]
+
+    candidate = re.sub(r"[._\-+]+", " ", candidate)
+    candidate = re.sub(r"\d+", " ", candidate)
+    candidate = re.sub(r"\s+", " ", candidate).strip(" ._-")
+
+    words = [word.capitalize() for word in candidate.split() if word]
+    if not words:
+        fallback = lead.email.split("@")[0].strip(" ._-").capitalize() or "There"
+        return fallback, fallback
+
+    full_name = " ".join(words)
+    first_name = (custom_first_name.split()[0].capitalize() if custom_first_name else words[0])
+    return first_name, full_name
+
+def personalize_content(content: str, lead: Lead) -> str:
+    """Replace merge tags with lead data."""
+    first_name, display_name = get_display_name_parts(lead)
+    name_parts = display_name.split()
+    last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+
+    replacements = {
+        "{{first_name}}": first_name,
+        "{{last_name}}": last_name,
+        "{{name}}": display_name,
+        "{{email}}": lead.email,
+        "{first_name}": first_name,
+        "{last_name}": last_name,
+        "{name}": display_name,
+        "{email}": lead.email,
+    }
+    
+    # Add custom fields
+    if lead.custom_fields:
+        for key, value in lead.custom_fields.items():
+            replacements[f"{{{{custom_{key}}}}}"] = str(value)
+            replacements[f"{{custom_{key}}}"] = str(value)
+    
+    for tag, value in replacements.items():
+        content = content.replace(tag, value)
+    
+    return content
+
+def send_single_email(lead: Lead, campaign: Optional[Campaign], sequence_step: Optional[SequenceStep], 
+                     user: User, db: Session, variant: Optional[str] = None) -> bool:
+    """Send a single email with all personalization and tracking."""
+    subject = None
+    body = None
+    try:
+        tracking_id = generate_tracking_id()
+        
+        # Determine content source
+        if sequence_step:
+            subject = sequence_step.subject
+            body = sequence_step.body
+            sender_name = sequence_step.sender_name
+        else:
+            fallback_first_name, _ = get_display_name_parts(lead)
+            subject = campaign.subject_template if campaign and campaign.subject_template else f"Hello {fallback_first_name}"
+            body = campaign.message_template if campaign else ""
+            sender_name = None
+
+        # Apply variation and personalization
+        subject = parse_spintax(subject)
+        body = parse_spintax(body)
+        subject = personalize_content(subject, lead)
+        body = personalize_content(body, lead)
+
+        # Add A/B testing variant to subject if applicable
+        if variant:
+            subject = f"[{variant}] {subject}"
+
+        # Append unsubscribe instructions to the body
+        unsubscribe_url = get_unsubscribe_url(lead)
+        body = f"{body}\n\nIf you no longer wish to receive these messages, unsubscribe here: {unsubscribe_url}"
+
+        # Process tracking
+        tracked_body = process_message_with_tracking(body, tracking_id, settings.BASE_URL)
+        
+        # Send email
+        sent_message = send_message(
+            user=user,
+            to=lead.email,
+            subject=subject,
+            body=tracked_body,
+            sender_name=sender_name,
+            unsubscribe_link=unsubscribe_url
+        )
+        
+        # Log the email
+        email_log = EmailLog(
+            user_id=user.id,
+            campaign_id=campaign.id if campaign else None,
+            lead_id=lead.id,
+            tracking_id=tracking_id,
+            message_id=sent_message.get("id"),
+            thread_id=sent_message.get("threadId"),
+            subject=subject,
+            body=tracked_body,
+            status="sent",
+            variant=variant,
+            sequence_step_id=sequence_step.id if sequence_step else None
+        )
+        db.add(email_log)
+        
+        # Update lead status
+        lead.status = "sent"
+        lead.sent_at = datetime.now(timezone.utc)
+        lead.last_contacted_at = datetime.now(timezone.utc)
+        lead.lifecycle_stage = "contacted"
+        
+        # Update sequence enrollment if applicable
+        if sequence_step:
+            enrollment = db.query(SequenceEnrollment).filter(
+                SequenceEnrollment.lead_id == lead.id,
+                SequenceEnrollment.sequence_id == sequence_step.sequence_id
+            ).first()
+            if enrollment:
+                enrollment.current_step += 1
+                # Schedule next step if exists
+                next_step = db.query(SequenceStep).filter(
+                    SequenceStep.sequence_id == sequence_step.sequence_id,
+                    SequenceStep.step_number == enrollment.current_step
+                ).first()
+                if next_step:
+                    enrollment.next_send_at = datetime.now(timezone.utc) + timedelta(hours=next_step.delay_hours)
+                else:
+                    enrollment.completed_at = datetime.now(timezone.utc)
+        
+        db.commit()
+        return True
+        
+    except Exception as e:
+        # Log failed email
+        error_msg = str(e)
+        print(f"❌ Failed to send email to {lead.email}: {error_msg}")
+        
+        email_log = EmailLog(
+            user_id=user.id,
+            campaign_id=campaign.id if campaign else None,
+            lead_id=lead.id,
+            tracking_id=generate_tracking_id(),
+            subject=subject if subject else "Failed email",
+            body=body if body else "",
+            status="failed",
+            error_message=error_msg,
+            variant=variant,
+            sequence_step_id=sequence_step.id if sequence_step else None
+        )
+        db.add(email_log)
+        db.commit()
+        return False
+
+def seconds_until_next_send_window(user: User, lead: Lead, campaign: Optional[Campaign] = None, sequence_step: Optional[SequenceStep] = None) -> int:
+    """Return seconds until the next allowable send window for the lead."""
+    now = datetime.now(timezone.utc)
+    recipient_tz = pytz.timezone(lead.timezone or user.timezone or "UTC")
+    local_now = now.astimezone(recipient_tz)
+
+    start_hour = 9
+    end_hour = 17
+    weekdays_only = True
+
+    if sequence_step:
+        if sequence_step.send_window_start:
+            start_hour = int(sequence_step.send_window_start.split(":")[0])
+        if sequence_step.send_window_end:
+            end_hour = int(sequence_step.send_window_end.split(":")[0])
+        weekdays_only = sequence_step.weekdays_only
+    elif campaign:
+        if campaign.send_window_start:
+            start_hour = int(campaign.send_window_start.split(":")[0])
+        if campaign.send_window_end:
+            end_hour = int(campaign.send_window_end.split(":")[0])
+        weekdays_only = campaign.send_window_weekdays_only
+
+    if local_now.hour < start_hour and (not weekdays_only or local_now.weekday() < 5):
+        target = local_now.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+    else:
+        target = local_now + timedelta(days=1)
+        while weekdays_only and target.weekday() >= 5:
+            target += timedelta(days=1)
+        target = target.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+
+    target_utc = target.astimezone(timezone.utc)
+    wait_seconds = (target_utc - now).total_seconds()
+    return int(max(60, wait_seconds))
+
+
+def send_campaign_emails(campaign_id: int, user_id: int, force_send: bool = False):
+    """Enhanced RQ job to send emails with all new features and scheduled delivery."""
+    db: Session = SessionLocal()
+    try:
+        campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
+        user = db.query(User).filter(User.id == user_id).first()
+
+        if not campaign or not user:
+            print(f"❌ Campaign {campaign_id} or User {user_id} not found")
+            return
+
+        # Handle scheduled send start time if specified
+        campaign_start = make_utc_aware(campaign.send_start_time)
+        if campaign_start:
+            now = datetime.now(timezone.utc)
+            if now < campaign_start:
+                # Wait until scheduled time
+                wait_seconds = (campaign_start - now).total_seconds()
+                if wait_seconds > 0:
+                    print(f"⏳ Campaign {campaign_id} scheduled to start at {campaign_start}. Waiting {wait_seconds} seconds...")
+                    time.sleep(wait_seconds)
+            campaign.status = "running"
+            db.commit()
+        
+        # Get daily limits and respect warm-up stages
+        daily_limit = get_current_daily_limit(user)
+        emails_sent_today = get_emails_sent_today(user_id, db)
+        
+        if emails_sent_today >= daily_limit:
+            # Daily limit reached
+            print(f"Daily limit reached for campaign {campaign_id}")
+            campaign.status = "paused"
+            db.commit()
+            return
+
+        # Get pending emails for this campaign and exclude unsubscribed recipients
+        pending_leads = db.query(Lead).filter(
+            Lead.campaign_id == campaign_id,
+            Lead.status == "pending",
+            Lead.opted_out.is_(False)
+        ).all()
+        
+        if not pending_leads:
+            print(f"✅ No pending leads for campaign {campaign_id}")
+            campaign.status = "completed"
+            db.commit()
+            return
+
+        # Max 30 emails per batch, respect daily limit
+        batch_size = max(1, campaign.hourly_send_rate or 5)
+        emails_remaining_today = daily_limit - emails_sent_today
+        emails_to_send = min(len(pending_leads), batch_size, emails_remaining_today)
+        
+        emails_sent_this_batch = 0
+        emails_failed_this_batch = 0
+        
+        for i in range(emails_to_send):
+            lead = pending_leads[i]
+            
+            # Enforce recipient business hours and working window unless forced by send-now
+            if not force_send and not is_optimal_send_time(user, lead, None, campaign):
+                wait_seconds = seconds_until_next_send_window(user, lead, campaign=campaign)
+                print(f"⏰ Lead {lead.email} is outside working hours. Waiting {wait_seconds} seconds before retrying.")
+                time.sleep(wait_seconds)
+                # Refresh lead state after wait
+                db.refresh(lead)
+
+            # Handle A/B testing
+            variant = None
+            if campaign.ab_test_config and campaign.ab_test_config.get("enabled"):
+                variants = campaign.ab_test_config.get("variants", [])
+                if variants:
+                    variant = random.choice(variants)["name"]
+            
+            # Send the email
+            success = send_single_email(lead, campaign, None, user, db, variant)
+            
+            if success:
+                emails_sent_this_batch += 1
+                
+                # Update daily log
+                today = datetime.now(timezone.utc).date()
+                daily_log = db.query(DailySendLog).filter(
+                    DailySendLog.user_id == user_id,
+                    func.date(DailySendLog.date) == today
+                ).first()
+                
+                if not daily_log:
+                    daily_log = DailySendLog(
+                        user_id=user_id,
+                        date=datetime.now(timezone.utc),
+                        emails_sent=0,
+                        emails_queued=0
+                    )
+                    db.add(daily_log)
+                
+                daily_log.emails_sent += 1
+                db.commit()
+            else:
+                emails_failed_this_batch += 1
+            
+            # Stop if reached hourly cap
+            if emails_sent_this_batch >= batch_size:
+                break
+            
+            if i < emails_to_send - 1:  # Don't sleep after last email
+                delay_seconds = max(get_delay_seconds(campaign), get_hourly_spacing_seconds(campaign))
+                print(f"⏸️  Campaign {campaign_id} waiting {delay_seconds} seconds before next send.")
+                time.sleep(delay_seconds)
+        
+        # Update batch counter
+        campaign.emails_sent_in_batch += emails_sent_this_batch
+        
+        # Check if campaign is complete
+        remaining_pending = db.query(Lead).filter(
+            Lead.campaign_id == campaign_id,
+            Lead.status == "pending"
+        ).count()
+        
+        if remaining_pending == 0:
+            campaign.status = "completed"
+            print(f"✅ Campaign {campaign_id} completed! Sent {campaign.emails_sent_in_batch} emails total.")
+        elif emails_sent_today + emails_sent_this_batch >= daily_limit:
+            campaign.status = "paused"
+            print(f"⏸️ Campaign {campaign_id} paused after hitting daily limit. Sent {emails_sent_this_batch}, Failed {emails_failed_this_batch}. Remaining: {remaining_pending}")
+        elif emails_sent_this_batch >= batch_size:
+            campaign.status = "queued"
+            print(f"📋 Campaign {campaign_id} queued for next hourly batch. Sent {emails_sent_this_batch}, Failed {emails_failed_this_batch}. Remaining: {remaining_pending}")
+        else:
+            campaign.status = "running"
+            print(f"📊 Campaign {campaign_id} running. Sent {emails_sent_this_batch}, Failed {emails_failed_this_batch}. Remaining: {remaining_pending}")
+        
+        db.commit()
+
+    except Exception as e:
+        print(f"❌ Error in send_campaign_emails: {str(e)}")
+        if campaign:
+            campaign.status = "failed"
+            db.commit()
+    finally:
+        db.close()
+
+async def check_bounces_and_replies():
+    """Background task to check for bounces and replies."""
+    while True:
+        db: Session = SessionLocal()
+        try:
+            # Get all sent emails from the last 7 days
+            seven_days_ago = datetime.utcnow() - timedelta(days=7)
+
+            sent_logs = db.query(EmailLog).filter(
+                EmailLog.status == "sent",
+                EmailLog.timestamp >= seven_days_ago
+            ).all()
+
+            for log in sent_logs:
+                try:
+                    # Get user for this log
+                    user = db.query(User).filter(User.id == log.user_id).first()
+                    if not user:
+                        continue
+
+                    # Check for bounces and replies
+                    if not log.message_id:
+                        continue
+                    result = check_for_bounces_and_replies(user, log.message_id)
+
+                    # Update status based on results
+                    lead = db.query(Lead).filter(Lead.id == log.lead_id).first()
+                    if not lead:
+                        continue
+
+                    if result['has_bounce']:
+                        log.status = "bounced"
+                        lead.status = "bounced"
+                        lead.bounced_at = datetime.utcnow()
+                        lead.lifecycle_stage = "unsubscribed"
+                    elif result['has_reply']:
+                        log.status = "replied"
+                        lead.status = "replied"
+                        lead.replied_at = datetime.utcnow()
+                        lead.reply_category = result.get('reply_category')
+                        lead.lifecycle_stage = "replied"
+                        lead.lead_score = (lead.lead_score or 0) + 15
+                        if result.get('reply_category') in {"interested", "referral"}:
+                            lead.needs_follow_up = True
+                        reply_content = (result.get("reply_content") or "").lower()
+                        if "unsubscribe" in reply_content or "remove me" in reply_content:
+                            lead.opted_out = True
+                            lead.opted_out_at = datetime.utcnow()
+                            lead.lifecycle_stage = "unsubscribed"
+
+                    db.commit()
+
+                except Exception as e:
+                    print(f"Error checking bounce/reply for log {log.id}: {str(e)}")
+                    continue
+
+        except Exception as e:
+            print(f"Error in check_bounces_and_replies: {str(e)}")
+        finally:
+            db.close()
+
+        # Check every hour
+        await asyncio.sleep(3600)
